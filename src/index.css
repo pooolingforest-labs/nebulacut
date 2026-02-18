@@ -1,0 +1,23 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  background: radial-gradient(circle at top, #0f172a 0%, #020617 60%);
+  color: #e2e8f0;
+  font-family: "Pretendard", "Inter", "Noto Sans KR", system-ui, -apple-system, sans-serif;
+}
