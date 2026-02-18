@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { PointerEvent as ReactPointerEvent } from "react";
+import type {
+  ChangeEvent as ReactChangeEvent,
+  PointerEvent as ReactPointerEvent,
+} from "react";
 import {
+  HiOutlineCog6Tooth,
   HiOutlineMusicalNote,
   HiOutlinePause,
   HiOutlinePhoto,
@@ -10,6 +14,7 @@ import {
   HiOutlineTrash,
   HiOutlineVideoCamera,
 } from "react-icons/hi2";
+import { useI18n, type LocalePreference } from "./i18n";
 
 type MediaType = "video" | "audio" | "image";
 type TrackType = "video" | "audio";
@@ -55,6 +60,108 @@ type DragState = {
 const MIN_CLIP_DURATION = 0.2;
 const EMPTY_TIMELINE_DURATION = 12;
 const DEFAULT_IMAGE_DURATION = 5;
+const API_KEYS_STORAGE_KEY = "nebulacut.aiProviderKeys";
+const MIN_TIMELINE_ZOOM = 40;
+const MAX_TIMELINE_ZOOM = 160;
+const DEFAULT_TIMELINE_ZOOM = 75;
+const PROJECT_FILE_KIND = "nebulacut.project";
+const PROJECT_FILE_VERSION = 1;
+const PROJECT_FILE_EXTENSION = ".nbcut";
+
+type ApiKeyName =
+  | "OPENAI_API_KEY"
+  | "ANTHROPIC_API_KEY"
+  | "GOOGLE_AI_API_KEY"
+  | "BYTEPLUS_ARK_API_KEY"
+  | "RUNWAY_API_KEY"
+  | "HIGGSFIELD_API_KEY"
+  | "HIGGSFIELD_API_SECRET";
+
+type ApiKeys = Record<ApiKeyName, string>;
+type SettingsTab = "general" | "aiProviders";
+type SerializedMediaAsset = {
+  id: string;
+  type: MediaType;
+  name: string;
+  mimeType: string;
+  dataUrl: string;
+};
+
+type ProjectStateSnapshot = {
+  assets: MediaAsset[];
+  tracks: Track[];
+  clips: Clip[];
+  selectedClipId: string | null;
+  playhead: number;
+  pixelsPerSecond: number;
+};
+
+type SerializedProjectState = {
+  assets: SerializedMediaAsset[];
+  tracks: Track[];
+  clips: Clip[];
+  selectedClipId: string | null;
+  playhead: number;
+  pixelsPerSecond: number;
+};
+
+type NebulaCutProjectFile = {
+  kind: typeof PROJECT_FILE_KIND;
+  version: typeof PROJECT_FILE_VERSION;
+  savedAt: string;
+  state: SerializedProjectState;
+};
+
+const API_KEY_FIELD_ORDER: ApiKeyName[] = [
+  "OPENAI_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "GOOGLE_AI_API_KEY",
+  "BYTEPLUS_ARK_API_KEY",
+  "RUNWAY_API_KEY",
+  "HIGGSFIELD_API_KEY",
+  "HIGGSFIELD_API_SECRET",
+];
+
+const EMPTY_API_KEYS: ApiKeys = {
+  OPENAI_API_KEY: "",
+  ANTHROPIC_API_KEY: "",
+  GOOGLE_AI_API_KEY: "",
+  BYTEPLUS_ARK_API_KEY: "",
+  RUNWAY_API_KEY: "",
+  HIGGSFIELD_API_KEY: "",
+  HIGGSFIELD_API_SECRET: "",
+};
+
+type ApiKeysNotice = "loadError" | "saved" | "saveError";
+
+function normalizeApiKeys(input: unknown): ApiKeys {
+  const source =
+    input && typeof input === "object"
+      ? (input as Partial<Record<ApiKeyName, unknown>>)
+      : {};
+
+  return {
+    OPENAI_API_KEY: typeof source.OPENAI_API_KEY === "string" ? source.OPENAI_API_KEY : "",
+    ANTHROPIC_API_KEY:
+      typeof source.ANTHROPIC_API_KEY === "string" ? source.ANTHROPIC_API_KEY : "",
+    GOOGLE_AI_API_KEY:
+      typeof source.GOOGLE_AI_API_KEY === "string" ? source.GOOGLE_AI_API_KEY : "",
+    BYTEPLUS_ARK_API_KEY:
+      typeof source.BYTEPLUS_ARK_API_KEY === "string" ? source.BYTEPLUS_ARK_API_KEY : "",
+    RUNWAY_API_KEY: typeof source.RUNWAY_API_KEY === "string" ? source.RUNWAY_API_KEY : "",
+    HIGGSFIELD_API_KEY:
+      typeof source.HIGGSFIELD_API_KEY === "string" ? source.HIGGSFIELD_API_KEY : "",
+    HIGGSFIELD_API_SECRET:
+      typeof source.HIGGSFIELD_API_SECRET === "string" ? source.HIGGSFIELD_API_SECRET : "",
+  };
+}
+
+function createDefaultTracks(): Track[] {
+  return [
+    { id: generateId(), name: "V1", type: "video" },
+    { id: generateId(), name: "A1", type: "audio" },
+  ];
+}
 
 function generateId() {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -67,24 +174,197 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
 }
 
-function formatTime(value: number) {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function isMediaType(value: unknown): value is MediaType {
+  return value === "video" || value === "audio" || value === "image";
+}
+
+function isTrackType(value: unknown): value is TrackType {
+  return value === "video" || value === "audio";
+}
+
+function getFileNameFromPath(pathLike: string) {
+  const chunks = pathLike.split(/[\\/]/);
+  const fallback = `untitled${PROJECT_FILE_EXTENSION}`;
+  return chunks[chunks.length - 1] || fallback;
+}
+
+function withProjectExtension(name: string) {
+  return name.endsWith(PROJECT_FILE_EXTENSION) ? name : `${name}${PROJECT_FILE_EXTENSION}`;
+}
+
+function fileToDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result;
+      if (typeof result === "string") {
+        resolve(result);
+        return;
+      }
+      reject(new Error("Invalid file read result."));
+    };
+    reader.onerror = () => reject(new Error("Failed to read file."));
+    reader.readAsDataURL(file);
+  });
+}
+
+function dataUrlToFile(dataUrl: string, name: string, mimeType: string) {
+  const [header, payload] = dataUrl.split(",", 2);
+  if (!header || !payload || !header.startsWith("data:")) {
+    throw new Error("Invalid data URL.");
+  }
+
+  const headerMimeType = header.slice(5).split(";")[0];
+  const resolvedMimeType = mimeType || headerMimeType || "application/octet-stream";
+  const binary = atob(payload);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new File([bytes], name, { type: resolvedMimeType });
+}
+
+function base64ToFile(base64Data: string, name: string, mimeType: string) {
+  const binary = atob(base64Data);
+  const bytes = new Uint8Array(binary.length);
+
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+
+  return new File([bytes], name, { type: mimeType || "application/octet-stream" });
+}
+
+function parseProjectFile(content: string): NebulaCutProjectFile | null {
+  let parsed: unknown = null;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return null;
+  }
+
+  if (!isRecord(parsed)) return null;
+  if (parsed.kind !== PROJECT_FILE_KIND || parsed.version !== PROJECT_FILE_VERSION) {
+    return null;
+  }
+
+  const state = parsed.state;
+  if (!isRecord(state)) return null;
+
+  if (!Array.isArray(state.assets) || !Array.isArray(state.tracks) || !Array.isArray(state.clips)) {
+    return null;
+  }
+
+  const assets: SerializedMediaAsset[] = [];
+  for (const item of state.assets) {
+    if (!isRecord(item)) return null;
+    if (
+      typeof item.id !== "string" ||
+      typeof item.name !== "string" ||
+      typeof item.mimeType !== "string" ||
+      typeof item.dataUrl !== "string" ||
+      !isMediaType(item.type)
+    ) {
+      return null;
+    }
+    assets.push({
+      id: item.id,
+      type: item.type,
+      name: item.name,
+      mimeType: item.mimeType,
+      dataUrl: item.dataUrl,
+    });
+  }
+
+  const tracks: Track[] = [];
+  for (const item of state.tracks) {
+    if (!isRecord(item)) return null;
+    if (typeof item.id !== "string" || typeof item.name !== "string" || !isTrackType(item.type)) {
+      return null;
+    }
+    tracks.push({
+      id: item.id,
+      name: item.name,
+      type: item.type,
+    });
+  }
+
+  const clips: Clip[] = [];
+  for (const item of state.clips) {
+    if (!isRecord(item)) return null;
+    if (
+      typeof item.id !== "string" ||
+      typeof item.trackId !== "string" ||
+      typeof item.assetId !== "string" ||
+      !isFiniteNumber(item.start) ||
+      !isFiniteNumber(item.offset) ||
+      !isFiniteNumber(item.duration) ||
+      !isFiniteNumber(item.gain)
+    ) {
+      return null;
+    }
+    clips.push({
+      id: item.id,
+      trackId: item.trackId,
+      assetId: item.assetId,
+      start: item.start,
+      offset: item.offset,
+      duration: item.duration,
+      gain: item.gain,
+    });
+  }
+
+  const selectedClipId = typeof state.selectedClipId === "string" ? state.selectedClipId : null;
+  const playhead = isFiniteNumber(state.playhead) ? Math.max(0, state.playhead) : 0;
+  const pixelsPerSecond = isFiniteNumber(state.pixelsPerSecond)
+    ? clamp(state.pixelsPerSecond, MIN_TIMELINE_ZOOM, MAX_TIMELINE_ZOOM)
+    : DEFAULT_TIMELINE_ZOOM;
+  const savedAt = typeof parsed.savedAt === "string" ? parsed.savedAt : new Date().toISOString();
+
+  return {
+    kind: PROJECT_FILE_KIND,
+    version: PROJECT_FILE_VERSION,
+    savedAt,
+    state: {
+      assets,
+      tracks,
+      clips,
+      selectedClipId,
+      playhead,
+      pixelsPerSecond,
+    },
+  };
+}
+
+function formatTime(value: number, twoDigitNumberFormatter: Intl.NumberFormat) {
   if (!Number.isFinite(value)) return "--:--";
   const total = Math.max(0, value);
   const minutes = Math.floor(total / 60);
   const seconds = Math.floor(total % 60);
   const hundredths = Math.floor((total % 1) * 100);
-  return `${minutes.toString().padStart(2, "0")}:${seconds
-    .toString()
-    .padStart(2, "0")}.${hundredths.toString().padStart(2, "0")}`;
+  return `${twoDigitNumberFormatter.format(minutes)}:${twoDigitNumberFormatter.format(
+    seconds,
+  )}.${twoDigitNumberFormatter.format(hundredths)}`;
 }
 
-function getAssetTypeLabel(type: MediaType) {
-  if (type === "video") return "Video";
-  if (type === "audio") return "Audio";
-  return "Image";
-}
+type LoadMediaErrorMessages = {
+  imageMetaLoad: string;
+  mediaMetaLoad: string;
+};
 
-async function loadMediaAsset(file: File, type: MediaType): Promise<MediaAsset> {
+async function loadMediaAsset(
+  file: File,
+  type: MediaType,
+  errorMessages: LoadMediaErrorMessages,
+): Promise<MediaAsset> {
   const url = URL.createObjectURL(file);
 
   if (type === "image") {
@@ -104,7 +384,7 @@ async function loadMediaAsset(file: File, type: MediaType): Promise<MediaAsset> 
       };
       image.onerror = () => {
         URL.revokeObjectURL(url);
-        reject(new Error("이미지 정보를 불러오지 못했습니다."));
+        reject(new Error(errorMessages.imageMetaLoad));
       };
       image.src = url;
     });
@@ -138,27 +418,39 @@ async function loadMediaAsset(file: File, type: MediaType): Promise<MediaAsset> 
 
     element.onerror = () => {
       URL.revokeObjectURL(url);
-      reject(new Error("미디어 정보를 불러오지 못했습니다."));
+      reject(new Error(errorMessages.mediaMetaLoad));
     };
   });
 }
 
 export default function App() {
   const [assets, setAssets] = useState<MediaAsset[]>([]);
-  const [tracks, setTracks] = useState<Track[]>([
-    { id: generateId(), name: "V1", type: "video" },
-    { id: generateId(), name: "A1", type: "audio" },
-  ]);
+  const [tracks, setTracks] = useState<Track[]>(createDefaultTracks);
   const [clips, setClips] = useState<Clip[]>([]);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [playhead, setPlayhead] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [pixelsPerSecond, setPixelsPerSecond] = useState(75);
+  const [pixelsPerSecond, setPixelsPerSecond] = useState(DEFAULT_TIMELINE_ZOOM);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [activeSettingsTab, setActiveSettingsTab] = useState<SettingsTab>("aiProviders");
+  const [apiKeys, setApiKeys] = useState<ApiKeys>(EMPTY_API_KEYS);
+  const [isLoadingApiKeys, setIsLoadingApiKeys] = useState(false);
+  const [isSavingApiKeys, setIsSavingApiKeys] = useState(false);
+  const [apiKeysNotice, setApiKeysNotice] = useState<ApiKeysNotice | null>(null);
+  const [projectFilePath, setProjectFilePath] = useState<string | null>(null);
+  const [projectFileName, setProjectFileName] = useState<string | null>(null);
+  const [isProjectBusy, setIsProjectBusy] = useState(false);
+  const [isMediaImportMenuOpen, setIsMediaImportMenuOpen] = useState(false);
+  const [isYouTubeDialogOpen, setIsYouTubeDialogOpen] = useState(false);
+  const [youtubeUrlInput, setYoutubeUrlInput] = useState("");
+  const [isDownloadingYouTube, setIsDownloadingYouTube] = useState(false);
 
   const videoInputRef = useRef<HTMLInputElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const audioInputRef = useRef<HTMLInputElement | null>(null);
+  const mediaImportMenuRef = useRef<HTMLDivElement | null>(null);
+  const projectInputRef = useRef<HTMLInputElement | null>(null);
   const timelineInnerRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const dragStateRef = useRef<DragState | null>(null);
@@ -167,6 +459,441 @@ export default function App() {
   const pendingVideoSeekRef = useRef<number | null>(null);
   const audioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
   const assetsRef = useRef<MediaAsset[]>([]);
+  const { locale, localePreference, setLocalePreference, systemLocale, t, formatNumber } =
+    useI18n();
+  const isElectronRuntime = window.nebulacut?.runtime === "electron";
+
+  const twoDigitNumberFormatter = useMemo(
+    () =>
+      new Intl.NumberFormat(locale, {
+        minimumIntegerDigits: 2,
+        useGrouping: false,
+      }),
+    [locale],
+  );
+
+  const formatTimeLabel = useCallback(
+    (value: number) => formatTime(value, twoDigitNumberFormatter),
+    [twoDigitNumberFormatter],
+  );
+
+  const mediaLoadErrors = useMemo<LoadMediaErrorMessages>(
+    () => ({
+      imageMetaLoad: t("errors.imageMetaLoad"),
+      mediaMetaLoad: t("errors.mediaMetaLoad"),
+    }),
+    [t],
+  );
+
+  const getAssetTypeLabel = useCallback(
+    (type: MediaType) => {
+      if (type === "video") return t("asset.video");
+      if (type === "audio") return t("asset.audio");
+      return t("asset.image");
+    },
+    [t],
+  );
+
+  const getTrackTypeLabel = useCallback(
+    (type: TrackType) => {
+      if (type === "video") return t("track.type.video");
+      return t("track.type.audio");
+    },
+    [t],
+  );
+
+  const loadApiKeys = useCallback(async () => {
+    setIsLoadingApiKeys(true);
+    setApiKeysNotice(null);
+
+    try {
+      if (window.nebulacut?.settings) {
+        const loaded = await window.nebulacut.settings.getApiKeys();
+        setApiKeys(normalizeApiKeys(loaded));
+      } else {
+        const raw = window.localStorage.getItem(API_KEYS_STORAGE_KEY);
+        const parsed = raw ? (JSON.parse(raw) as unknown) : null;
+        setApiKeys(normalizeApiKeys(parsed));
+      }
+    } catch (error) {
+      console.error("[settings] Failed to load API keys.", error);
+      setApiKeysNotice("loadError");
+    } finally {
+      setIsLoadingApiKeys(false);
+    }
+  }, []);
+
+  const handleSaveApiKeys = useCallback(async () => {
+    setIsSavingApiKeys(true);
+    setApiKeysNotice(null);
+
+    try {
+      if (window.nebulacut?.settings) {
+        const saved = await window.nebulacut.settings.setApiKeys(apiKeys);
+        setApiKeys(normalizeApiKeys(saved));
+      } else {
+        window.localStorage.setItem(API_KEYS_STORAGE_KEY, JSON.stringify(apiKeys));
+      }
+
+      setApiKeysNotice("saved");
+    } catch (error) {
+      console.error("[settings] Failed to save API keys.", error);
+      setApiKeysNotice("saveError");
+    } finally {
+      setIsSavingApiKeys(false);
+    }
+  }, [apiKeys]);
+
+  useEffect(() => {
+    void loadApiKeys();
+  }, [loadApiKeys]);
+
+  const apiKeysNoticeMessage = useMemo(() => {
+    if (apiKeysNotice === "saved") return t("settings.notice.saved");
+    if (apiKeysNotice === "saveError") return t("settings.notice.saveError");
+    if (apiKeysNotice === "loadError") return t("settings.notice.loadError");
+    return null;
+  }, [apiKeysNotice, t]);
+
+  const projectDisplayName = useMemo(
+    () => projectFileName ?? t("project.untitled"),
+    [projectFileName, t],
+  );
+
+  const replaceProjectState = useCallback((nextState: ProjectStateSnapshot) => {
+    setIsPlaying(false);
+    dragStateRef.current = null;
+    scrubPointerIdRef.current = null;
+    activeVideoClipRef.current = null;
+    pendingVideoSeekRef.current = null;
+    audioElementsRef.current.forEach((audio) => audio.pause());
+    audioElementsRef.current.clear();
+
+    setAssets((prev) => {
+      prev.forEach((asset) => URL.revokeObjectURL(asset.url));
+      return nextState.assets;
+    });
+    setTracks(nextState.tracks.length > 0 ? nextState.tracks : createDefaultTracks());
+    setClips(nextState.clips);
+    setSelectedClipId(nextState.selectedClipId);
+    setPlayhead(Math.max(0, nextState.playhead));
+    setPixelsPerSecond(
+      clamp(nextState.pixelsPerSecond, MIN_TIMELINE_ZOOM, MAX_TIMELINE_ZOOM),
+    );
+  }, []);
+
+  const loadProjectContent = useCallback(
+    async (content: string, sourcePathOrName: string | null) => {
+      const parsedProject = parseProjectFile(content);
+      if (!parsedProject) {
+        throw new Error(t("project.notice.invalidFile"));
+      }
+
+      const loadedAssets: MediaAsset[] = [];
+      try {
+        for (const serializedAsset of parsedProject.state.assets) {
+          let file: File;
+          try {
+            file = dataUrlToFile(
+              serializedAsset.dataUrl,
+              serializedAsset.name,
+              serializedAsset.mimeType,
+            );
+          } catch {
+            throw new Error(t("project.notice.invalidFile"));
+          }
+
+          const loadedAsset = await loadMediaAsset(file, serializedAsset.type, mediaLoadErrors);
+          loadedAssets.push({
+            ...loadedAsset,
+            id: serializedAsset.id,
+            name: serializedAsset.name,
+          });
+        }
+      } catch (error) {
+        loadedAssets.forEach((asset) => URL.revokeObjectURL(asset.url));
+        throw error;
+      }
+
+      const nextTracks =
+        parsedProject.state.tracks.length > 0
+          ? parsedProject.state.tracks
+          : createDefaultTracks();
+      const trackIds = new Set(nextTracks.map((track) => track.id));
+      const assetIds = new Set(loadedAssets.map((asset) => asset.id));
+      const nextClips = parsedProject.state.clips.filter((clip) => {
+        if (!trackIds.has(clip.trackId) || !assetIds.has(clip.assetId)) return false;
+        if (clip.start < 0 || clip.offset < 0 || clip.duration < MIN_CLIP_DURATION) return false;
+        return true;
+      });
+      const nextSelectedClipId =
+        parsedProject.state.selectedClipId &&
+        nextClips.some((clip) => clip.id === parsedProject.state.selectedClipId)
+          ? parsedProject.state.selectedClipId
+          : null;
+
+      replaceProjectState({
+        assets: loadedAssets,
+        tracks: nextTracks,
+        clips: nextClips,
+        selectedClipId: nextSelectedClipId,
+        playhead: parsedProject.state.playhead,
+        pixelsPerSecond: parsedProject.state.pixelsPerSecond,
+      });
+
+      const fallbackName = `untitled${PROJECT_FILE_EXTENSION}`;
+      const nextPath = sourcePathOrName && sourcePathOrName.trim() ? sourcePathOrName : null;
+      const nextFileName = getFileNameFromPath(nextPath ?? fallbackName);
+
+      setProjectFilePath(nextPath);
+      setProjectFileName(nextFileName);
+
+      return nextFileName;
+    },
+    [mediaLoadErrors, replaceProjectState, t],
+  );
+
+  const handleProjectFileSelection = useCallback(
+    async (event: ReactChangeEvent<HTMLInputElement>) => {
+      const file = event.currentTarget.files?.[0];
+      event.currentTarget.value = "";
+      if (!file) return;
+
+      setIsProjectBusy(true);
+      setStatusMessage(null);
+
+      try {
+        const content = await file.text();
+        const loadedName = await loadProjectContent(content, file.name);
+        setStatusMessage(t("project.notice.loaded", { name: loadedName }));
+      } catch (error) {
+        console.error("[project] Failed to load project file.", error);
+        setStatusMessage(error instanceof Error ? error.message : t("project.notice.openError"));
+      } finally {
+        setIsProjectBusy(false);
+      }
+    },
+    [loadProjectContent, t],
+  );
+
+  const handleOpenProject = useCallback(async () => {
+    setStatusMessage(null);
+
+    if (!window.nebulacut?.project) {
+      projectInputRef.current?.click();
+      return;
+    }
+
+    setIsProjectBusy(true);
+    try {
+      const result = await window.nebulacut.project.open();
+      if (result.canceled) return;
+
+      const loadedName = await loadProjectContent(result.content, result.filePath);
+      setStatusMessage(t("project.notice.loaded", { name: loadedName }));
+    } catch (error) {
+      console.error("[project] Failed to open project.", error);
+      setStatusMessage(error instanceof Error ? error.message : t("project.notice.openError"));
+    } finally {
+      setIsProjectBusy(false);
+    }
+  }, [loadProjectContent, t]);
+
+  const handleSaveProject = useCallback(async () => {
+    setIsProjectBusy(true);
+    setStatusMessage(null);
+
+    try {
+      const serializedAssets: SerializedMediaAsset[] = [];
+      for (const asset of assets) {
+        serializedAssets.push({
+          id: asset.id,
+          type: asset.type,
+          name: asset.name,
+          mimeType: asset.file.type,
+          dataUrl: await fileToDataUrl(asset.file),
+        });
+      }
+
+      const projectPayload: NebulaCutProjectFile = {
+        kind: PROJECT_FILE_KIND,
+        version: PROJECT_FILE_VERSION,
+        savedAt: new Date().toISOString(),
+        state: {
+          assets: serializedAssets,
+          tracks,
+          clips,
+          selectedClipId,
+          playhead,
+          pixelsPerSecond,
+        },
+      };
+
+      const content = JSON.stringify(projectPayload, null, 2);
+      const suggestedPath =
+        (projectFilePath && projectFilePath.trim()) ||
+        (projectFileName && projectFileName.trim()) ||
+        `untitled${PROJECT_FILE_EXTENSION}`;
+
+      if (window.nebulacut?.project) {
+        const result = await window.nebulacut.project.save(content, suggestedPath);
+        if (result.canceled) return;
+
+        const savedName = getFileNameFromPath(result.filePath);
+        setProjectFilePath(result.filePath);
+        setProjectFileName(savedName);
+        setStatusMessage(t("project.notice.saved", { name: savedName }));
+        return;
+      }
+
+      const downloadName = withProjectExtension(
+        projectFileName && projectFileName.trim()
+          ? projectFileName
+          : `untitled${PROJECT_FILE_EXTENSION}`,
+      );
+      const blob = new Blob([content], { type: "application/json" });
+      const downloadUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = downloadUrl;
+      anchor.download = downloadName;
+      document.body.append(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(downloadUrl);
+
+      setProjectFilePath(null);
+      setProjectFileName(downloadName);
+      setStatusMessage(t("project.notice.saved", { name: downloadName }));
+    } catch (error) {
+      console.error("[project] Failed to save project.", error);
+      setStatusMessage(t("project.notice.saveError"));
+    } finally {
+      setIsProjectBusy(false);
+    }
+  }, [
+    assets,
+    clips,
+    pixelsPerSecond,
+    playhead,
+    projectFileName,
+    projectFilePath,
+    selectedClipId,
+    t,
+    tracks,
+  ]);
+
+  const handleOpenYouTubeDialog = useCallback(() => {
+    setIsMediaImportMenuOpen(false);
+    setYoutubeUrlInput("");
+    setIsYouTubeDialogOpen(true);
+  }, []);
+
+  const handleDownloadFromYouTube = useCallback(async () => {
+    const normalizedUrl = youtubeUrlInput.trim();
+    if (!normalizedUrl) {
+      setStatusMessage(t("youtube.notice.emptyUrl"));
+      return;
+    }
+
+    if (!window.nebulacut?.media) {
+      setStatusMessage(t("youtube.notice.electronOnly"));
+      return;
+    }
+
+    setStatusMessage(null);
+    setIsDownloadingYouTube(true);
+
+    try {
+      const result = await window.nebulacut.media.downloadYouTube(normalizedUrl);
+      if (!result.success) {
+        if (result.reason === "INVALID_URL") {
+          setStatusMessage(t("youtube.notice.invalidUrl"));
+          return;
+        }
+        if (result.reason === "YTDLP_NOT_FOUND") {
+          setStatusMessage(t("youtube.notice.toolMissing"));
+          return;
+        }
+        if (result.reason === "FILE_READ_FAILED") {
+          setStatusMessage(t("youtube.notice.readFailed"));
+          return;
+        }
+        if (result.reason === "UNSUPPORTED_MEDIA_TYPE") {
+          setStatusMessage(t("youtube.notice.unsupportedType"));
+          return;
+        }
+
+        setStatusMessage(t("youtube.notice.downloadFailed"));
+        return;
+      }
+
+      const file = base64ToFile(result.base64Data, result.fileName, result.mimeType);
+      const asset = await loadMediaAsset(file, result.mediaType, mediaLoadErrors);
+      setAssets((prev) => [...prev, { ...asset, name: result.fileName }]);
+      setIsYouTubeDialogOpen(false);
+      setYoutubeUrlInput("");
+      setStatusMessage(t("youtube.notice.success", { name: result.fileName }));
+    } catch (error) {
+      console.error("[media] Failed to import YouTube media.", error);
+      setStatusMessage(t("youtube.notice.downloadFailed"));
+    } finally {
+      setIsDownloadingYouTube(false);
+    }
+  }, [mediaLoadErrors, t, youtubeUrlInput]);
+
+  const handleOpenMediaImportPicker = useCallback((type: MediaType) => {
+    setIsMediaImportMenuOpen(false);
+
+    if (type === "video") {
+      videoInputRef.current?.click();
+      return;
+    }
+    if (type === "image") {
+      imageInputRef.current?.click();
+      return;
+    }
+    audioInputRef.current?.click();
+  }, []);
+
+  useEffect(() => {
+    if (!isMediaImportMenuOpen) return;
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (mediaImportMenuRef.current?.contains(target)) return;
+      setIsMediaImportMenuOpen(false);
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setIsMediaImportMenuOpen(false);
+      }
+    };
+
+    window.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      window.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [isMediaImportMenuOpen]);
+
+  useEffect(() => {
+    if (!isYouTubeDialogOpen || isDownloadingYouTube) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setIsYouTubeDialogOpen(false);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [isDownloadingYouTube, isYouTubeDialogOpen]);
 
   const assetMap = useMemo(() => new Map(assets.map((asset) => [asset.id, asset])), [assets]);
 
@@ -391,23 +1118,23 @@ export default function App() {
     try {
       const loaded: MediaAsset[] = [];
       for (const file of Array.from(files)) {
-        loaded.push(await loadMediaAsset(file, type));
+        loaded.push(await loadMediaAsset(file, type, mediaLoadErrors));
       }
       setAssets((prev) => [...prev, ...loaded]);
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : "파일을 불러오지 못했습니다.");
+      setStatusMessage(error instanceof Error ? error.message : t("errors.fileLoad"));
     }
-  }, []);
+  }, [mediaLoadErrors, t]);
 
   const handleAddClip = useCallback(
     (asset: MediaAsset, targetTrackType: TrackType) => {
       if (targetTrackType === "video" && asset.type === "audio") {
-        setStatusMessage("오디오 파일은 비디오 트랙에 추가할 수 없습니다.");
+        setStatusMessage(t("errors.audioToVideoForbidden"));
         return;
       }
 
       if (targetTrackType === "audio" && asset.type !== "audio") {
-        setStatusMessage("오디오 트랙에는 오디오 파일만 추가할 수 있습니다.");
+        setStatusMessage(t("errors.onlyAudioOnAudioTrack"));
         return;
       }
 
@@ -437,7 +1164,7 @@ export default function App() {
       setSelectedClipId(nextClip.id);
       setStatusMessage(null);
     },
-    [clips, ensureTrack],
+    [clips, ensureTrack, t],
   );
 
   const handleDeleteClip = useCallback(() => {
@@ -454,7 +1181,7 @@ export default function App() {
       splitPoint <= selectedClip.start + MIN_CLIP_DURATION ||
       splitPoint >= selectedClip.start + selectedClip.duration - MIN_CLIP_DURATION
     ) {
-      setStatusMessage("분할 지점이 클립 경계에 너무 가깝습니다.");
+      setStatusMessage(t("errors.splitTooClose"));
       return;
     }
 
@@ -483,7 +1210,7 @@ export default function App() {
 
     setSelectedClipId(secondClip.id);
     setStatusMessage(null);
-  }, [assetMap, effectivePlayhead, selectedClip]);
+  }, [assetMap, effectivePlayhead, selectedClip, t]);
 
   const handleUpdateClip = useCallback((clipId: string, patch: Partial<Clip>) => {
     setClips((prev) =>
@@ -624,11 +1351,14 @@ export default function App() {
     const step = timelineDuration > 90 ? 10 : timelineDuration > 40 ? 5 : 1;
 
     for (let time = 0; time <= timelineDuration; time += step) {
-      labels.push({ time, label: `${time}s` });
+      labels.push({
+        time,
+        label: `${formatNumber(time)}${t("timeline.secondSuffix")}`,
+      });
     }
 
     return labels;
-  }, [timelineDuration]);
+  }, [formatNumber, t, timelineDuration]);
 
   return (
     <div className="h-full bg-slate-950 text-slate-100">
@@ -636,30 +1366,49 @@ export default function App() {
         <header className="border-b border-white/10 bg-slate-900/90 px-4 py-3">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
-              <p className="text-sm font-semibold tracking-wide text-cyan-300">NebulaCut</p>
-              <p className="text-xs text-slate-400">Electron Local Video Editor</p>
+              <p className="text-sm font-semibold tracking-wide text-cyan-300">{t("app.title")}</p>
+              <p className="text-xs text-slate-400">{t("app.subtitle")}</p>
+              <p className="text-[11px] text-slate-500">
+                {t("project.current", { name: projectDisplayName })}
+              </p>
             </div>
             <div className="flex flex-wrap items-center gap-2">
+              <label className="inline-flex items-center gap-2 rounded-md border border-white/15 bg-white/5 px-2 py-1 text-xs text-slate-300">
+                <span>{t("language.label")}</span>
+                <select
+                  className="rounded border border-white/20 bg-slate-900/90 px-1 py-0.5 text-xs text-slate-100"
+                  value={localePreference}
+                  onChange={(event) =>
+                    setLocalePreference(event.target.value as LocalePreference)
+                  }
+                >
+                  <option value="system">
+                    {t("language.system")} ({systemLocale.toUpperCase()})
+                  </option>
+                  <option value="en">{t("language.english")}</option>
+                  <option value="ko">{t("language.korean")}</option>
+                </select>
+              </label>
               <button
-                className="inline-flex items-center gap-1 rounded-md border border-cyan-300/40 bg-cyan-400/10 px-3 py-1.5 text-xs font-semibold text-cyan-200 hover:bg-cyan-400/20"
-                onClick={() => videoInputRef.current?.click()}
+                className="inline-flex items-center gap-1 rounded-md border border-violet-300/40 bg-violet-400/10 px-3 py-1.5 text-xs font-semibold text-violet-100 hover:bg-violet-400/20 disabled:cursor-not-allowed disabled:opacity-50"
+                onClick={() => void handleOpenProject()}
+                disabled={isProjectBusy}
               >
-                <HiOutlineVideoCamera className="text-sm" />
-                비디오 추가
+                {t("header.openProject")}
               </button>
               <button
-                className="inline-flex items-center gap-1 rounded-md border border-amber-300/40 bg-amber-400/10 px-3 py-1.5 text-xs font-semibold text-amber-100 hover:bg-amber-400/20"
-                onClick={() => imageInputRef.current?.click()}
+                className="inline-flex items-center gap-1 rounded-md border border-teal-300/40 bg-teal-400/10 px-3 py-1.5 text-xs font-semibold text-teal-100 hover:bg-teal-400/20 disabled:cursor-not-allowed disabled:opacity-50"
+                onClick={() => void handleSaveProject()}
+                disabled={isProjectBusy}
               >
-                <HiOutlinePhoto className="text-sm" />
-                이미지 추가
+                {t("header.saveProject")}
               </button>
               <button
-                className="inline-flex items-center gap-1 rounded-md border border-indigo-300/40 bg-indigo-400/10 px-3 py-1.5 text-xs font-semibold text-indigo-100 hover:bg-indigo-400/20"
-                onClick={() => audioInputRef.current?.click()}
+                className="inline-flex items-center gap-1 rounded-md border border-emerald-300/40 bg-emerald-400/10 px-3 py-1.5 text-xs font-semibold text-emerald-100 hover:bg-emerald-400/20"
+                onClick={() => setIsSettingsOpen(true)}
               >
-                <HiOutlineMusicalNote className="text-sm" />
-                오디오 추가
+                <HiOutlineCog6Tooth className="text-sm" />
+                {t("header.settings")}
               </button>
             </div>
           </div>
@@ -698,15 +1447,270 @@ export default function App() {
             event.currentTarget.value = "";
           }}
         />
+        <input
+          ref={projectInputRef}
+          type="file"
+          accept=".nbcut,.json,application/json"
+          hidden
+          onChange={(event) => {
+            void handleProjectFileSelection(event);
+          }}
+        />
+
+        {isYouTubeDialogOpen && (
+          <div
+            className="fixed inset-0 z-40 flex items-center justify-center bg-slate-950/80 p-4"
+            onClick={() => {
+              if (!isDownloadingYouTube) {
+                setIsYouTubeDialogOpen(false);
+              }
+            }}
+          >
+            <div
+              className="w-full max-w-lg rounded-xl border border-white/10 bg-slate-900 shadow-2xl"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="border-b border-white/10 px-4 py-3">
+                <h2 className="text-sm font-semibold text-cyan-200">{t("youtube.dialog.title")}</h2>
+                <p className="mt-1 text-xs text-slate-400">{t("youtube.dialog.description")}</p>
+              </div>
+
+              <form
+                className="space-y-3 px-4 py-3"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void handleDownloadFromYouTube();
+                }}
+              >
+                <label className="block text-xs text-slate-300">
+                  <span className="font-medium text-slate-100">{t("youtube.inputLabel")}</span>
+                  <input
+                    className="mt-1 w-full rounded-md border border-white/15 bg-slate-950/80 px-2 py-1.5 text-sm text-slate-100"
+                    type="url"
+                    required
+                    autoFocus
+                    value={youtubeUrlInput}
+                    placeholder={t("youtube.inputPlaceholder")}
+                    onChange={(event) => setYoutubeUrlInput(event.target.value)}
+                  />
+                </label>
+
+                <div className="flex items-center justify-end gap-2 border-t border-white/10 pt-3">
+                  <button
+                    type="button"
+                    className="rounded-md border border-white/20 bg-white/5 px-3 py-1.5 text-xs text-slate-100 hover:bg-white/10"
+                    onClick={() => setIsYouTubeDialogOpen(false)}
+                    disabled={isDownloadingYouTube}
+                  >
+                    {t("youtube.cancel")}
+                  </button>
+                  <button
+                    type="submit"
+                    className="rounded-md border border-cyan-300/40 bg-cyan-500/20 px-3 py-1.5 text-xs font-semibold text-cyan-100 hover:bg-cyan-500/30 disabled:cursor-not-allowed disabled:opacity-60"
+                    disabled={isDownloadingYouTube}
+                  >
+                    {isDownloadingYouTube ? t("youtube.downloading") : t("youtube.download")}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {isSettingsOpen && (
+          <div className="fixed inset-0 z-40 flex items-center justify-center bg-slate-950/80 p-4">
+            <div className="max-h-[88vh] w-full max-w-4xl overflow-hidden rounded-xl border border-white/10 bg-slate-900 shadow-2xl">
+              <div className="flex items-start justify-between border-b border-white/10 px-4 py-3">
+                <div>
+                  <h2 className="text-sm font-semibold text-emerald-200">{t("header.settings")}</h2>
+                  <p className="mt-1 text-xs text-slate-400">{t("settings.description")}</p>
+                </div>
+                <button
+                  className="rounded-md border border-white/20 bg-white/5 px-2 py-1 text-xs text-slate-200 hover:bg-white/10"
+                  onClick={() => setIsSettingsOpen(false)}
+                >
+                  {t("settings.close")}
+                </button>
+              </div>
+
+              <div className="grid max-h-[70vh] min-h-[62vh] grid-cols-1 md:grid-cols-[220px_minmax(0,1fr)]">
+                <aside className="border-b border-white/10 bg-slate-950/50 p-3 md:border-b-0 md:border-r">
+                  <p className="px-2 pb-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                    {t("settings.menu")}
+                  </p>
+                  <div className="space-y-1">
+                    <button
+                      className={`w-full rounded-md px-2 py-2 text-left text-xs ${
+                        activeSettingsTab === "general"
+                          ? "border border-white/20 bg-white/10 text-white"
+                          : "border border-transparent bg-transparent text-slate-300 hover:bg-white/5"
+                      }`}
+                      onClick={() => setActiveSettingsTab("general")}
+                    >
+                      {t("settings.tab.general")}
+                    </button>
+                    <button
+                      className={`w-full rounded-md px-2 py-2 text-left text-xs ${
+                        activeSettingsTab === "aiProviders"
+                          ? "border border-emerald-300/30 bg-emerald-500/15 text-emerald-100"
+                          : "border border-transparent bg-transparent text-slate-300 hover:bg-white/5"
+                      }`}
+                      onClick={() => setActiveSettingsTab("aiProviders")}
+                    >
+                      {t("settings.tab.aiProviders")}
+                    </button>
+                  </div>
+                </aside>
+
+                <main className="min-h-0 overflow-y-auto px-4 py-3">
+                  {activeSettingsTab === "general" ? (
+                    <div className="rounded-lg border border-dashed border-white/15 bg-slate-950/40 p-4">
+                      <h3 className="text-sm font-semibold text-white">{t("settings.general.title")}</h3>
+                      <p className="mt-1 text-xs text-slate-400">{t("settings.general.empty")}</p>
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      <div>
+                        <h3 className="text-sm font-semibold text-emerald-100">
+                          {t("settings.tab.aiProviders")}
+                        </h3>
+                        <p className="mt-1 text-xs text-slate-400">{t("settings.subtitle")}</p>
+                      </div>
+                      <p className="text-xs text-slate-400">{t("settings.helper")}</p>
+
+                      {apiKeysNoticeMessage && (
+                        <div
+                          className={`rounded border px-3 py-2 text-xs ${
+                            apiKeysNotice === "saved"
+                              ? "border-emerald-300/30 bg-emerald-500/10 text-emerald-100"
+                              : "border-amber-300/30 bg-amber-500/10 text-amber-100"
+                          }`}
+                        >
+                          {apiKeysNoticeMessage}
+                        </div>
+                      )}
+
+                      {isLoadingApiKeys ? (
+                        <div className="rounded border border-white/10 bg-slate-950/50 px-3 py-2 text-xs text-slate-300">
+                          {t("settings.loading")}
+                        </div>
+                      ) : (
+                        <div className="space-y-3">
+                          {API_KEY_FIELD_ORDER.map((field) => (
+                            <label key={field} className="block text-xs text-slate-300">
+                              <span className="font-medium text-slate-100">
+                                {t("settings.variableLabel", { name: field })}
+                              </span>
+                              <input
+                                className="mt-1 w-full rounded-md border border-white/15 bg-slate-950/80 px-2 py-1.5 font-mono text-sm text-slate-100"
+                                type="password"
+                                autoComplete="off"
+                                spellCheck={false}
+                                value={apiKeys[field]}
+                                placeholder={t("settings.inputPlaceholder")}
+                                onChange={(event) => {
+                                  const nextValue = event.target.value;
+                                  setApiKeys((prev) => ({ ...prev, [field]: nextValue }));
+                                  setApiKeysNotice(null);
+                                }}
+                              />
+                            </label>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </main>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-2 border-t border-white/10 px-4 py-3">
+                <p className="text-[11px] text-slate-500">
+                  {activeSettingsTab === "aiProviders"
+                    ? isElectronRuntime
+                      ? t("settings.storage.electron")
+                      : t("settings.storage.browser")
+                    : t("settings.general.footer")}
+                </p>
+                <div className="flex items-center gap-2">
+                  <button
+                    className="rounded-md border border-white/20 bg-white/5 px-3 py-1.5 text-xs text-slate-100 hover:bg-white/10"
+                    onClick={() => setIsSettingsOpen(false)}
+                  >
+                    {t("settings.close")}
+                  </button>
+                  <button
+                    className="rounded-md border border-emerald-300/40 bg-emerald-500/20 px-3 py-1.5 text-xs font-semibold text-emerald-100 hover:bg-emerald-500/30 disabled:cursor-not-allowed disabled:opacity-50"
+                    onClick={() => void handleSaveApiKeys()}
+                    disabled={activeSettingsTab !== "aiProviders" || isLoadingApiKeys || isSavingApiKeys}
+                  >
+                    {isSavingApiKeys ? t("settings.saving") : t("settings.save")}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
 
         <section className="grid min-h-0 flex-1 grid-cols-1 gap-px bg-white/5 xl:grid-cols-[260px_minmax(0,1fr)_300px]">
           <aside className="min-h-0 overflow-y-auto bg-slate-900/60 p-4">
-            <h2 className="mb-3 text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
-              Media Library
-            </h2>
+            <div className="mb-3 flex items-center justify-between">
+              <h2 className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
+                {t("media.library")}
+              </h2>
+              <div ref={mediaImportMenuRef} className="relative">
+                <button
+                  type="button"
+                  className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-cyan-300/40 bg-cyan-400/10 text-cyan-200 hover:bg-cyan-400/20"
+                  onClick={() => setIsMediaImportMenuOpen((prev) => !prev)}
+                >
+                  <HiOutlinePlus
+                    className={`text-base transition-transform ${
+                      isMediaImportMenuOpen ? "rotate-45" : ""
+                    }`}
+                  />
+                </button>
+
+                {isMediaImportMenuOpen && (
+                  <div className="absolute right-0 z-30 mt-2 w-40 rounded-md border border-white/15 bg-slate-950/95 p-1 shadow-xl">
+                    <button
+                      type="button"
+                      className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-slate-200 hover:bg-white/10"
+                      onClick={() => handleOpenMediaImportPicker("video")}
+                    >
+                      <HiOutlineVideoCamera className="text-sm text-cyan-200" />
+                      {t("header.addVideo")}
+                    </button>
+                    <button
+                      type="button"
+                      className="mt-0.5 flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-slate-200 hover:bg-white/10"
+                      onClick={() => handleOpenMediaImportPicker("image")}
+                    >
+                      <HiOutlinePhoto className="text-sm text-amber-200" />
+                      {t("header.addImage")}
+                    </button>
+                    <button
+                      type="button"
+                      className="mt-0.5 flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-slate-200 hover:bg-white/10"
+                      onClick={() => handleOpenMediaImportPicker("audio")}
+                    >
+                      <HiOutlineMusicalNote className="text-sm text-indigo-200" />
+                      {t("header.addAudio")}
+                    </button>
+                    <button
+                      type="button"
+                      className="mt-0.5 flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-slate-200 hover:bg-white/10"
+                      onClick={handleOpenYouTubeDialog}
+                    >
+                      <HiOutlineVideoCamera className="text-sm text-rose-200" />
+                      {t("media.addFromYouTube")}
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
             {assets.length === 0 ? (
               <div className="rounded-lg border border-dashed border-white/15 bg-slate-950/40 p-3 text-xs text-slate-400">
-                비디오, 이미지, 오디오를 추가해서 타임라인을 구성하세요.
+                {t("media.empty")}
               </div>
             ) : (
               <div className="space-y-2">
@@ -722,7 +1726,7 @@ export default function App() {
                       <p className="truncate text-sm font-medium text-white">{asset.name}</p>
                       <div className="mt-1 flex items-center justify-between text-[11px] text-slate-400">
                         <span>{getAssetTypeLabel(asset.type)}</span>
-                        <span>{formatTime(asset.duration)}</span>
+                        <span>{formatTimeLabel(asset.duration)}</span>
                       </div>
                       <div className="mt-2 flex gap-2">
                         {canToVideo && (
@@ -730,7 +1734,7 @@ export default function App() {
                             className="rounded border border-cyan-300/40 bg-cyan-400/10 px-2 py-1 text-[11px] font-semibold text-cyan-100 hover:bg-cyan-400/20"
                             onClick={() => handleAddClip(asset, "video")}
                           >
-                            + 비디오 트랙
+                            {t("media.toVideoTrack")}
                           </button>
                         )}
                         {canToAudio && (
@@ -738,7 +1742,7 @@ export default function App() {
                             className="rounded border border-indigo-300/40 bg-indigo-400/10 px-2 py-1 text-[11px] font-semibold text-indigo-100 hover:bg-indigo-400/20"
                             onClick={() => handleAddClip(asset, "audio")}
                           >
-                            + 오디오 트랙
+                            {t("media.toAudioTrack")}
                           </button>
                         )}
                       </div>
@@ -769,7 +1773,7 @@ export default function App() {
                 )}
                 {!activeVisualClip && (
                   <div className="absolute inset-0 flex items-center justify-center text-sm text-slate-500">
-                    타임라인에 클립을 추가하세요
+                    {t("preview.empty")}
                   </div>
                 )}
               </div>
@@ -781,37 +1785,39 @@ export default function App() {
                     onClick={() => setIsPlaying((prev) => !prev)}
                   >
                     {isPlaying ? <HiOutlinePause /> : <HiOutlinePlay />}
-                    {isPlaying ? "일시정지" : "재생"}
+                    {isPlaying ? t("controls.pause") : t("controls.play")}
                   </button>
                   <button
                     className="inline-flex items-center gap-1 rounded-md border border-white/20 bg-white/5 px-3 py-1.5 text-xs font-semibold text-white hover:bg-white/10"
                     onClick={handleSplitClip}
                   >
                     <HiOutlineScissors />
-                    분할
+                    {t("controls.split")}
                   </button>
                   <button
                     className="inline-flex items-center gap-1 rounded-md border border-rose-300/40 bg-rose-500/10 px-3 py-1.5 text-xs font-semibold text-rose-200 hover:bg-rose-500/20"
                     onClick={handleDeleteClip}
                   >
                     <HiOutlineTrash />
-                    삭제
+                    {t("controls.delete")}
                   </button>
                 </div>
                 <div className="rounded border border-white/10 bg-white/5 px-2 py-1 text-xs text-slate-300">
-                  Playhead {formatTime(effectivePlayhead)}
+                  {t("controls.playhead", { time: formatTimeLabel(effectivePlayhead) })}
                 </div>
               </div>
             </div>
 
             <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
               <div className="rounded border border-white/10 bg-slate-900/60 p-3">
-                <p className="text-slate-400">타임라인 길이</p>
-                <p className="mt-1 font-semibold text-white">{formatTime(timelineDuration)}</p>
+                <p className="text-slate-400">{t("stats.timelineDuration")}</p>
+                <p className="mt-1 font-semibold text-white">
+                  {formatTimeLabel(timelineDuration)}
+                </p>
               </div>
               <div className="rounded border border-white/10 bg-slate-900/60 p-3">
-                <p className="text-slate-400">클립 수</p>
-                <p className="mt-1 font-semibold text-white">{clips.length}</p>
+                <p className="text-slate-400">{t("stats.clipCount")}</p>
+                <p className="mt-1 font-semibold text-white">{formatNumber(clips.length)}</p>
               </div>
             </div>
 
@@ -824,18 +1830,22 @@ export default function App() {
 
           <aside className="min-h-0 overflow-y-auto bg-slate-900/60 p-4">
             <h2 className="mb-3 text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
-              Inspector
+              {t("inspector.title")}
             </h2>
 
             {selectedClip ? (
               <div className="space-y-3">
                 <div className="rounded border border-white/10 bg-slate-950/60 p-3 text-xs text-slate-300">
-                  <p>Clip ID: {selectedClip.id.slice(0, 8)}</p>
-                  <p className="mt-1">Type: {selectedAsset ? getAssetTypeLabel(selectedAsset.type) : "-"}</p>
+                  <p>{t("inspector.clipId", { id: selectedClip.id.slice(0, 8) })}</p>
+                  <p className="mt-1">
+                    {t("inspector.type", {
+                      type: selectedAsset ? getAssetTypeLabel(selectedAsset.type) : "-",
+                    })}
+                  </p>
                 </div>
 
                 <label className="block text-xs text-slate-300">
-                  시작 (s)
+                  {t("inspector.startSeconds")}
                   <input
                     className="mt-1 w-full rounded-md border border-white/15 bg-slate-950/80 px-2 py-1.5 text-sm"
                     type="number"
@@ -849,7 +1859,7 @@ export default function App() {
                 </label>
 
                 <label className="block text-xs text-slate-300">
-                  길이 (s)
+                  {t("inspector.durationSeconds")}
                   <input
                     className="mt-1 w-full rounded-md border border-white/15 bg-slate-950/80 px-2 py-1.5 text-sm"
                     type="number"
@@ -878,7 +1888,7 @@ export default function App() {
 
                 {selectedAsset?.type !== "image" && (
                   <label className="block text-xs text-slate-300">
-                    오프셋 (s)
+                    {t("inspector.offsetSeconds")}
                     <input
                       className="mt-1 w-full rounded-md border border-white/15 bg-slate-950/80 px-2 py-1.5 text-sm"
                       type="number"
@@ -900,7 +1910,7 @@ export default function App() {
 
                 {selectedTrack?.type === "audio" && (
                   <label className="block text-xs text-slate-300">
-                    볼륨
+                    {t("inspector.volume")}
                     <input
                       className="mt-1 w-full rounded-md border border-white/15 bg-slate-950/80 px-2 py-1.5 text-sm"
                       type="number"
@@ -919,12 +1929,12 @@ export default function App() {
               </div>
             ) : (
               <div className="rounded border border-dashed border-white/15 bg-slate-950/40 p-3 text-xs text-slate-400">
-                타임라인에서 클립을 선택하면 편집 항목이 표시됩니다.
+                {t("inspector.empty")}
               </div>
             )}
 
             <h2 className="mb-3 mt-6 text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
-              Tracks
+              {t("tracks.title")}
             </h2>
             <div className="space-y-2">
               {tracks.map((track) => (
@@ -933,7 +1943,7 @@ export default function App() {
                   className="flex items-center justify-between rounded border border-white/10 bg-slate-950/60 px-3 py-2 text-xs"
                 >
                   <span>{track.name}</span>
-                  <span className="text-slate-400">{track.type}</span>
+                  <span className="text-slate-400">{getTrackTypeLabel(track.type)}</span>
                 </div>
               ))}
             </div>
@@ -944,14 +1954,14 @@ export default function App() {
                 onClick={() => setTracks((prev) => [...prev, createTrack("video")])}
               >
                 <HiOutlinePlus />
-                비디오 트랙
+                {t("tracks.addVideo")}
               </button>
               <button
                 className="inline-flex items-center gap-1 rounded-md border border-indigo-300/40 bg-indigo-400/10 px-2 py-1 text-xs font-semibold text-indigo-100 hover:bg-indigo-400/20"
                 onClick={() => setTracks((prev) => [...prev, createTrack("audio")])}
               >
                 <HiOutlinePlus />
-                오디오 트랙
+                {t("tracks.addAudio")}
               </button>
             </div>
           </aside>
@@ -960,22 +1970,26 @@ export default function App() {
         <section className="border-t border-white/10 bg-slate-950/80 px-3 py-2">
           <div className="mb-2 flex items-center justify-between text-xs text-slate-300">
             <div className="flex items-center gap-2">
-              <span>Zoom</span>
+              <span>{t("timeline.zoom")}</span>
               <input
                 type="range"
-                min="40"
-                max="160"
+                min={MIN_TIMELINE_ZOOM}
+                max={MAX_TIMELINE_ZOOM}
                 value={pixelsPerSecond}
-                onChange={(event) => setPixelsPerSecond(Number(event.target.value))}
+                onChange={(event) =>
+                  setPixelsPerSecond(
+                    clamp(Number(event.target.value), MIN_TIMELINE_ZOOM, MAX_TIMELINE_ZOOM),
+                  )
+                }
               />
             </div>
-            <span>Timeline {formatTime(timelineDuration)}</span>
+            <span>{t("timeline.label", { time: formatTimeLabel(timelineDuration) })}</span>
           </div>
 
           <div className="overflow-x-auto rounded-lg border border-white/10 bg-slate-900/70">
             <div className="grid min-w-max grid-cols-[120px_1fr] border-b border-white/10">
               <div className="border-r border-white/10 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
-                Tracks
+                {t("tracks.title")}
               </div>
               <div className="relative h-8" style={{ width: timelineWidth }}>
                 {rulerLabels.map((label) => (
@@ -998,7 +2012,7 @@ export default function App() {
                     className="flex h-14 items-center justify-between border-b border-white/10 px-3 text-xs"
                   >
                     <span>{track.name}</span>
-                    <span className="text-slate-500">{track.type}</span>
+                    <span className="text-slate-500">{getTrackTypeLabel(track.type)}</span>
                   </div>
                 ))}
               </div>
@@ -1053,7 +2067,7 @@ export default function App() {
                                 }
                               />
                               <div className="min-w-0 flex-1 px-2 text-[11px] font-medium text-white">
-                                <p className="truncate">{asset?.name ?? "Clip"}</p>
+                                <p className="truncate">{asset?.name ?? t("clip.defaultName")}</p>
                               </div>
                               <div
                                 className="h-full w-2 cursor-ew-resize border-l border-black/30 bg-black/30"
