@@ -11,6 +11,9 @@ type ApiKeyName =
 
 type ApiKeys = Record<ApiKeyName, string>;
 type ImportedMediaType = "video" | "audio";
+type YouTubeDownloadOptions = {
+  preferWebM?: boolean;
+};
 
 type ProjectSaveResult =
   | { canceled: true }
@@ -46,6 +49,15 @@ type YouTubeDownloadResult =
         | "UNSUPPORTED_MEDIA_TYPE";
     };
 
+type ShowInFolderResult =
+  | {
+      success: true;
+    }
+  | {
+      success: false;
+      reason: "INVALID_PATH" | "OPEN_FAILED";
+    };
+
 type NebulacutBridge = {
   runtime: "electron";
   settings?: {
@@ -57,7 +69,8 @@ type NebulacutBridge = {
     open: () => Promise<ProjectOpenResult>;
   };
   media?: {
-    downloadYouTube: (url: string) => Promise<YouTubeDownloadResult>;
+    downloadYouTube: (url: string, options?: YouTubeDownloadOptions) => Promise<YouTubeDownloadResult>;
+    showInFolder: (filePath: string) => Promise<ShowInFolderResult>;
   };
 };
 

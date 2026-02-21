@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import { execFile } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -19,6 +19,8 @@ const API_KEY_NAMES = [
 const PROJECT_FILE_EXTENSION = "nbcut";
 const PROJECT_FILE_DEFAULT_NAME = `untitled.${PROJECT_FILE_EXTENSION}`;
 const YOUTUBE_MEDIA_DIRECTORY_NAME = "NebulaCut";
+const HOME_DIRECTORY = process.env.HOME ?? process.env.USERPROFILE ?? "";
+const LOCAL_BIN_DIRECTORY = HOME_DIRECTORY ? path.join(HOME_DIRECTORY, ".local", "bin") : "";
 
 const YOUTUBE_HOSTS = new Set([
   "youtube.com",
@@ -130,48 +132,137 @@ function detectMimeTypeByExtension(filePath) {
   return MIME_BY_EXTENSION[extension] ?? "application/octet-stream";
 }
 
-function runYtDlpDownload(youtubeUrl, outputTemplate) {
-  return new Promise((resolve, reject) => {
-    const args = [
-      "--no-playlist",
-      "--no-progress",
-      "--no-warnings",
-      "--restrict-filenames",
-      "--print",
-      "after_move:filepath",
-      "-o",
-      outputTemplate,
-      youtubeUrl,
-    ];
+function normalizeYouTubeDownloadOptions(input) {
+  const source = input && typeof input === "object" ? input : {};
+  return {
+    preferWebM:
+      "preferWebM" in source && typeof source.preferWebM === "boolean" ? source.preferWebM : false,
+  };
+}
 
-    execFile("yt-dlp", args, { maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
-      if (error) {
-        const normalizedError = Object.assign(new Error("yt-dlp failed"), {
-          code: error.code,
-          stderr,
-        });
-        reject(normalizedError);
-        return;
-      }
+function getYtDlpFormatSelector(options) {
+  if (options.preferWebM) {
+    return (
+      "bestvideo[ext=webm][height<=1080]/" +
+      "bestvideo[ext=webm]/" +
+      "best[ext=webm]/" +
+      "best[ext=mp4]/" +
+      "bestaudio[ext=webm]/" +
+      "bestaudio[ext=m4a]/" +
+      "best"
+    );
+  }
 
-      const filePath = stdout
-        .split(/\r?\n/g)
-        .map((line) => line.trim())
-        .filter(Boolean)
-        .pop();
+  return "best[ext=mp4]/bestaudio[ext=m4a]/best";
+}
 
-      if (!filePath) {
-        const normalizedError = Object.assign(new Error("yt-dlp output is empty"), {
-          code: "EMPTY_OUTPUT",
-          stderr,
-        });
-        reject(normalizedError);
-        return;
-      }
+function runYtDlpDownload(youtubeUrl, outputTemplate, options) {
+  const formatSelector = getYtDlpFormatSelector(options);
+  const downloadArgs = [
+    "--no-playlist",
+    "--no-progress",
+    "--no-warnings",
+    "--force-overwrites",
+    "--restrict-filenames",
+    "--format",
+    formatSelector,
+    "--print",
+    "after_move:filepath",
+    "-o",
+    outputTemplate,
+    youtubeUrl,
+  ];
 
-      resolve(filePath);
+  const commandCandidates = [
+    { command: "yt-dlp", args: downloadArgs },
+    ...(LOCAL_BIN_DIRECTORY
+      ? [{ command: path.join(LOCAL_BIN_DIRECTORY, "yt-dlp"), args: downloadArgs }]
+      : []),
+    { command: "/opt/homebrew/bin/yt-dlp", args: downloadArgs },
+    { command: "/usr/local/bin/yt-dlp", args: downloadArgs },
+    { command: "python3", args: ["-m", "yt_dlp", ...downloadArgs] },
+    ...(LOCAL_BIN_DIRECTORY
+      ? [{ command: path.join(LOCAL_BIN_DIRECTORY, "python3"), args: ["-m", "yt_dlp", ...downloadArgs] }]
+      : []),
+    { command: "python", args: ["-m", "yt_dlp", ...downloadArgs] },
+  ];
+
+  const runCandidate = (candidate) =>
+    new Promise((resolve, reject) => {
+      execFile(
+        candidate.command,
+        candidate.args,
+        { maxBuffer: 8 * 1024 * 1024 },
+        (error, stdout, stderr) => {
+          if (error) {
+            const normalizedError = Object.assign(new Error("yt-dlp failed"), {
+              code: error.code,
+              stderr,
+            });
+            reject(normalizedError);
+            return;
+          }
+
+          const filePath = stdout
+            .split(/\r?\n/g)
+            .map((line) => line.trim())
+            .filter(Boolean)
+            .pop();
+
+          if (!filePath) {
+            const normalizedError = Object.assign(new Error("yt-dlp output is empty"), {
+              code: "EMPTY_OUTPUT",
+              stderr,
+            });
+            reject(normalizedError);
+            return;
+          }
+
+          resolve(filePath);
+        },
+      );
     });
-  });
+
+  return (async () => {
+    let notFoundCount = 0;
+
+    for (const candidate of commandCandidates) {
+      try {
+        return await runCandidate(candidate);
+      } catch (error) {
+        const stderr =
+          error && typeof error === "object" && "stderr" in error && typeof error.stderr === "string"
+            ? error.stderr
+            : "";
+
+        const isNotFound =
+          error &&
+          typeof error === "object" &&
+          "code" in error &&
+          (error.code === "ENOENT" || error.code === 127);
+
+        const isMissingPythonModule =
+          stderr.includes("No module named yt_dlp") ||
+          stderr.includes("No module named yt-dlp");
+
+        if (isNotFound || isMissingPythonModule) {
+          notFoundCount += 1;
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    if (notFoundCount === commandCandidates.length) {
+      const missingError = new Error("yt-dlp not found");
+      Object.assign(missingError, { code: "ENOENT" });
+      throw missingError;
+    }
+
+    const unknownError = new Error("yt-dlp failed");
+    Object.assign(unknownError, { code: "DOWNLOAD_FAILED" });
+    throw unknownError;
+  })();
 }
 
 function getSettingsFilePath() {
@@ -265,7 +356,7 @@ ipcMain.handle("project:open", async () => {
   };
 });
 
-ipcMain.handle("media:downloadYouTube", async (_event, rawUrl) => {
+ipcMain.handle("media:downloadYouTube", async (_event, rawUrl, rawOptions) => {
   const normalizedUrl = normalizeYouTubeUrl(rawUrl);
   if (!normalizedUrl) {
     return {
@@ -273,6 +364,7 @@ ipcMain.handle("media:downloadYouTube", async (_event, rawUrl) => {
       reason: "INVALID_URL",
     };
   }
+  const downloadOptions = normalizeYouTubeDownloadOptions(rawOptions);
 
   const outputDirectory = getYouTubeMediaDirectoryPath();
   const outputTemplate = path.join(outputDirectory, "%(title).160B-%(id)s.%(ext)s");
@@ -281,7 +373,7 @@ ipcMain.handle("media:downloadYouTube", async (_event, rawUrl) => {
 
   let downloadedFilePath = "";
   try {
-    downloadedFilePath = await runYtDlpDownload(normalizedUrl, outputTemplate);
+    downloadedFilePath = await runYtDlpDownload(normalizedUrl, outputTemplate, downloadOptions);
   } catch (error) {
     if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
       return {
@@ -327,6 +419,30 @@ ipcMain.handle("media:downloadYouTube", async (_event, rawUrl) => {
   }
 });
 
+ipcMain.handle("media:showInFolder", async (_event, rawFilePath) => {
+  if (typeof rawFilePath !== "string" || rawFilePath.trim().length === 0) {
+    return {
+      success: false,
+      reason: "INVALID_PATH",
+    };
+  }
+
+  const resolvedPath = path.resolve(rawFilePath.trim());
+
+  try {
+    shell.showItemInFolder(resolvedPath);
+    return {
+      success: true,
+    };
+  } catch (error) {
+    console.error("[media] Failed to open source folder.", error);
+    return {
+      success: false,
+      reason: "OPEN_FAILED",
+    };
+  }
+});
+
 function createMainWindow() {
   const window = new BrowserWindow({
     width: 1460,
@@ -344,6 +460,7 @@ function createMainWindow() {
   const devServerUrl = process.env.VITE_DEV_SERVER_URL;
   if (devServerUrl) {
     window.loadURL(devServerUrl);
+    window.webContents.openDevTools({ mode: "right" });
   } else {
     window.loadFile(path.join(__dirname, "../dist/index.html"));
   }

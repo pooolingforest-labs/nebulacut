@@ -58,8 +58,11 @@ contextBridge.exposeInMainWorld("nebulacut", {
     },
   },
   media: {
-    downloadYouTube: async (url) => {
-      return ipcRenderer.invoke("media:downloadYouTube", url);
+    downloadYouTube: async (url, options) => {
+      return ipcRenderer.invoke("media:downloadYouTube", url, options);
+    },
+    showInFolder: async (filePath) => {
+      return ipcRenderer.invoke("media:showInFolder", filePath);
     },
   },
 });

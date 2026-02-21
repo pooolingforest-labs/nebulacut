@@ -28,6 +28,8 @@ type MediaAsset = {
   duration: number;
   width?: number;
   height?: number;
+  sourcePath?: string;
+  hasAudioTrack?: boolean;
 };
 
 type Track = {
@@ -61,8 +63,10 @@ const MIN_CLIP_DURATION = 0.2;
 const EMPTY_TIMELINE_DURATION = 12;
 const DEFAULT_IMAGE_DURATION = 5;
 const API_KEYS_STORAGE_KEY = "nebulacut.aiProviderKeys";
-const MIN_TIMELINE_ZOOM = 40;
-const MAX_TIMELINE_ZOOM = 160;
+const TIMELINE_ZOOM_HARD_MIN = 8;
+const TIMELINE_ZOOM_HARD_MAX = 640;
+const TIMELINE_ZOOM_EMPTY_MIN = 40;
+const TIMELINE_ZOOM_EMPTY_MAX = 160;
 const DEFAULT_TIMELINE_ZOOM = 75;
 const PROJECT_FILE_KIND = "nebulacut.project";
 const PROJECT_FILE_VERSION = 1;
@@ -85,6 +89,8 @@ type SerializedMediaAsset = {
   name: string;
   mimeType: string;
   dataUrl: string;
+  sourcePath?: string;
+  hasAudioTrack?: boolean;
 };
 
 type ProjectStateSnapshot = {
@@ -174,6 +180,59 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
 }
 
+type TimelineZoomRange = {
+  min: number;
+  max: number;
+};
+
+function getTimelineZoomRange(clips: Clip[]): TimelineZoomRange {
+  if (clips.length === 0) {
+    return {
+      min: TIMELINE_ZOOM_EMPTY_MIN,
+      max: TIMELINE_ZOOM_EMPTY_MAX,
+    };
+  }
+
+  let maxTimelineEnd = EMPTY_TIMELINE_DURATION;
+  let minClipDuration = Number.POSITIVE_INFINITY;
+
+  for (const clip of clips) {
+    maxTimelineEnd = Math.max(maxTimelineEnd, clip.start + clip.duration);
+    if (clip.duration > 0) {
+      minClipDuration = Math.min(minClipDuration, clip.duration);
+    }
+  }
+
+  if (!Number.isFinite(minClipDuration)) {
+    minClipDuration = MIN_CLIP_DURATION;
+  }
+
+  // Zoom-out lower bound: keep whole timeline navigable while tiny clips remain visible.
+  const minByTimeline = 360 / maxTimelineEnd;
+  const minByShortestClip = 2 / minClipDuration;
+  let min = clamp(
+    Math.max(minByTimeline, minByShortestClip),
+    TIMELINE_ZOOM_HARD_MIN,
+    120,
+  );
+
+  // Zoom-in upper bound: let the shortest clip be expanded for detailed edits.
+  let max = clamp(
+    320 / minClipDuration,
+    TIMELINE_ZOOM_EMPTY_MAX,
+    TIMELINE_ZOOM_HARD_MAX,
+  );
+
+  if (max < min + 20) {
+    max = clamp(min + 20, TIMELINE_ZOOM_EMPTY_MAX, TIMELINE_ZOOM_HARD_MAX);
+    if (max <= min) {
+      min = Math.max(TIMELINE_ZOOM_HARD_MIN, max - 20);
+    }
+  }
+
+  return { min, max };
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -194,6 +253,17 @@ function getFileNameFromPath(pathLike: string) {
   const chunks = pathLike.split(/[\\/]/);
   const fallback = `untitled${PROJECT_FILE_EXTENSION}`;
   return chunks[chunks.length - 1] || fallback;
+}
+
+type FileWithOptionalPath = File & {
+  path?: string;
+};
+
+function getFilePathFromFile(file: File) {
+  const pathCandidate = (file as FileWithOptionalPath).path;
+  if (typeof pathCandidate !== "string") return null;
+  const normalized = pathCandidate.trim();
+  return normalized.length > 0 ? normalized : null;
 }
 
 function withProjectExtension(name: string) {
@@ -281,6 +351,11 @@ function parseProjectFile(content: string): NebulaCutProjectFile | null {
       name: item.name,
       mimeType: item.mimeType,
       dataUrl: item.dataUrl,
+      sourcePath:
+        typeof item.sourcePath === "string" && item.sourcePath.trim().length > 0
+          ? item.sourcePath.trim()
+          : undefined,
+      hasAudioTrack: typeof item.hasAudioTrack === "boolean" ? item.hasAudioTrack : undefined,
     });
   }
 
@@ -324,9 +399,10 @@ function parseProjectFile(content: string): NebulaCutProjectFile | null {
 
   const selectedClipId = typeof state.selectedClipId === "string" ? state.selectedClipId : null;
   const playhead = isFiniteNumber(state.playhead) ? Math.max(0, state.playhead) : 0;
+  const timelineZoomRange = getTimelineZoomRange(clips);
   const pixelsPerSecond = isFiniteNumber(state.pixelsPerSecond)
-    ? clamp(state.pixelsPerSecond, MIN_TIMELINE_ZOOM, MAX_TIMELINE_ZOOM)
-    : DEFAULT_TIMELINE_ZOOM;
+    ? clamp(state.pixelsPerSecond, timelineZoomRange.min, timelineZoomRange.max)
+    : clamp(DEFAULT_TIMELINE_ZOOM, timelineZoomRange.min, timelineZoomRange.max);
   const savedAt = typeof parsed.savedAt === "string" ? parsed.savedAt : new Date().toISOString();
 
   return {
@@ -359,6 +435,46 @@ type LoadMediaErrorMessages = {
   imageMetaLoad: string;
   mediaMetaLoad: string;
 };
+
+type VideoElementWithAudioMetadata = HTMLVideoElement & {
+  audioTracks?: { length: number };
+  mozHasAudio?: boolean;
+  webkitAudioDecodedByteCount?: number;
+  captureStream?: () => MediaStream;
+};
+
+function detectVideoHasAudioTrack(video: HTMLVideoElement) {
+  const metadata = video as VideoElementWithAudioMetadata;
+
+  const audioTrackCount = metadata.audioTracks?.length;
+  if (typeof audioTrackCount === "number") {
+    return audioTrackCount > 0;
+  }
+
+  if (typeof metadata.mozHasAudio === "boolean") {
+    return metadata.mozHasAudio;
+  }
+
+  if (
+    typeof metadata.webkitAudioDecodedByteCount === "number" &&
+    Number.isFinite(metadata.webkitAudioDecodedByteCount)
+  ) {
+    return metadata.webkitAudioDecodedByteCount > 0;
+  }
+
+  if (typeof metadata.captureStream === "function") {
+    try {
+      const stream = metadata.captureStream();
+      const hasAudio = stream.getAudioTracks().length > 0;
+      stream.getTracks().forEach((track) => track.stop());
+      return hasAudio;
+    } catch {
+      return false;
+    }
+  }
+
+  return false;
+}
 
 async function loadMediaAsset(
   file: File,
@@ -411,6 +527,7 @@ async function loadMediaAsset(
         const video = element as HTMLVideoElement;
         asset.width = video.videoWidth;
         asset.height = video.videoHeight;
+        asset.hasAudioTrack = detectVideoHasAudioTrack(video);
       }
 
       resolve(asset);
@@ -445,6 +562,7 @@ export default function App() {
   const [isYouTubeDialogOpen, setIsYouTubeDialogOpen] = useState(false);
   const [youtubeUrlInput, setYoutubeUrlInput] = useState("");
   const [isDownloadingYouTube, setIsDownloadingYouTube] = useState(false);
+  const [youtubeDialogNotice, setYoutubeDialogNotice] = useState<string | null>(null);
 
   const videoInputRef = useRef<HTMLInputElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
@@ -577,8 +695,9 @@ export default function App() {
     setClips(nextState.clips);
     setSelectedClipId(nextState.selectedClipId);
     setPlayhead(Math.max(0, nextState.playhead));
+    const timelineZoomRange = getTimelineZoomRange(nextState.clips);
     setPixelsPerSecond(
-      clamp(nextState.pixelsPerSecond, MIN_TIMELINE_ZOOM, MAX_TIMELINE_ZOOM),
+      clamp(nextState.pixelsPerSecond, timelineZoomRange.min, timelineZoomRange.max),
     );
   }, []);
 
@@ -608,6 +727,8 @@ export default function App() {
             ...loadedAsset,
             id: serializedAsset.id,
             name: serializedAsset.name,
+            sourcePath: serializedAsset.sourcePath,
+            hasAudioTrack: serializedAsset.hasAudioTrack ?? loadedAsset.hasAudioTrack,
           });
         }
       } catch (error) {
@@ -712,6 +833,8 @@ export default function App() {
           name: asset.name,
           mimeType: asset.file.type,
           dataUrl: await fileToDataUrl(asset.file),
+          sourcePath: asset.sourcePath,
+          hasAudioTrack: asset.hasAudioTrack,
         });
       }
 
@@ -785,57 +908,146 @@ export default function App() {
   const handleOpenYouTubeDialog = useCallback(() => {
     setIsMediaImportMenuOpen(false);
     setYoutubeUrlInput("");
+    setYoutubeDialogNotice(null);
     setIsYouTubeDialogOpen(true);
   }, []);
 
   const handleDownloadFromYouTube = useCallback(async () => {
     const normalizedUrl = youtubeUrlInput.trim();
     if (!normalizedUrl) {
-      setStatusMessage(t("youtube.notice.emptyUrl"));
+      const notice = t("youtube.notice.emptyUrl");
+      setYoutubeDialogNotice(notice);
+      setStatusMessage(notice);
       return;
     }
 
     if (!window.nebulacut?.media) {
-      setStatusMessage(t("youtube.notice.electronOnly"));
+      const notice = t("youtube.notice.electronOnly");
+      setYoutubeDialogNotice(notice);
+      setStatusMessage(notice);
       return;
     }
 
+    setYoutubeDialogNotice(null);
     setStatusMessage(null);
     setIsDownloadingYouTube(true);
 
-    try {
-      const result = await window.nebulacut.media.downloadYouTube(normalizedUrl);
-      if (!result.success) {
-        if (result.reason === "INVALID_URL") {
-          setStatusMessage(t("youtube.notice.invalidUrl"));
-          return;
-        }
-        if (result.reason === "YTDLP_NOT_FOUND") {
-          setStatusMessage(t("youtube.notice.toolMissing"));
-          return;
-        }
-        if (result.reason === "FILE_READ_FAILED") {
-          setStatusMessage(t("youtube.notice.readFailed"));
-          return;
-        }
-        if (result.reason === "UNSUPPORTED_MEDIA_TYPE") {
-          setStatusMessage(t("youtube.notice.unsupportedType"));
-          return;
-        }
-
-        setStatusMessage(t("youtube.notice.downloadFailed"));
+    const setYouTubeFailureNotice = (
+      reason:
+        | "INVALID_URL"
+        | "YTDLP_NOT_FOUND"
+        | "DOWNLOAD_FAILED"
+        | "FILE_READ_FAILED"
+        | "UNSUPPORTED_MEDIA_TYPE",
+    ) => {
+      if (reason === "INVALID_URL") {
+        const notice = t("youtube.notice.invalidUrl");
+        setYoutubeDialogNotice(notice);
+        setStatusMessage(notice);
+        return;
+      }
+      if (reason === "YTDLP_NOT_FOUND") {
+        const notice = t("youtube.notice.toolMissing");
+        setYoutubeDialogNotice(notice);
+        setStatusMessage(notice);
+        return;
+      }
+      if (reason === "FILE_READ_FAILED") {
+        const notice = t("youtube.notice.readFailed");
+        setYoutubeDialogNotice(notice);
+        setStatusMessage(notice);
+        return;
+      }
+      if (reason === "UNSUPPORTED_MEDIA_TYPE") {
+        const notice = t("youtube.notice.unsupportedType");
+        setYoutubeDialogNotice(notice);
+        setStatusMessage(notice);
         return;
       }
 
-      const file = base64ToFile(result.base64Data, result.fileName, result.mimeType);
-      const asset = await loadMediaAsset(file, result.mediaType, mediaLoadErrors);
-      setAssets((prev) => [...prev, { ...asset, name: result.fileName }]);
+      const notice = t("youtube.notice.downloadFailed");
+      setYoutubeDialogNotice(notice);
+      setStatusMessage(notice);
+    };
+
+    const importDownloadedMedia = async (downloadedMedia: {
+      filePath: string;
+      fileName: string;
+      mimeType: string;
+      mediaType: "video" | "audio";
+      base64Data: string;
+    }) => {
+      const file = base64ToFile(downloadedMedia.base64Data, downloadedMedia.fileName, downloadedMedia.mimeType);
+      const asset = await loadMediaAsset(file, downloadedMedia.mediaType, mediaLoadErrors);
+      setAssets((prev) => [
+        ...prev,
+        { ...asset, name: downloadedMedia.fileName, sourcePath: downloadedMedia.filePath },
+      ]);
       setIsYouTubeDialogOpen(false);
       setYoutubeUrlInput("");
-      setStatusMessage(t("youtube.notice.success", { name: result.fileName }));
+      setYoutubeDialogNotice(null);
+      setStatusMessage(t("youtube.notice.success", { name: downloadedMedia.fileName }));
+    };
+
+    const isWebMDownload = (downloadedMedia: { fileName: string; mimeType: string }) => {
+      const lowerMimeType = downloadedMedia.mimeType.toLowerCase();
+      const lowerFileName = downloadedMedia.fileName.toLowerCase();
+      return lowerMimeType.includes("webm") || lowerFileName.endsWith(".webm");
+    };
+
+    try {
+      const initialResult = await window.nebulacut.media.downloadYouTube(normalizedUrl);
+      if (!initialResult.success) {
+        setYouTubeFailureNotice(initialResult.reason);
+        return;
+      }
+
+      try {
+        await importDownloadedMedia(initialResult);
+      } catch (error) {
+        console.warn(
+          "[media] Retrying YouTube import with WebM preference after metadata load failure.",
+          {
+            error,
+            fileName: initialResult.fileName,
+            mimeType: initialResult.mimeType,
+            mediaType: initialResult.mediaType,
+          },
+        );
+
+        const retryResult = await window.nebulacut.media.downloadYouTube(normalizedUrl, {
+          preferWebM: true,
+        });
+        if (!retryResult.success) {
+          setYouTubeFailureNotice(retryResult.reason);
+          return;
+        }
+
+        try {
+          await importDownloadedMedia(retryResult);
+        } catch (retryError) {
+          console.error("[media] Failed to import YouTube media after WebM retry.", {
+            retryError,
+            fileName: retryResult.fileName,
+            mimeType: retryResult.mimeType,
+            mediaType: retryResult.mediaType,
+          });
+
+          if (!isWebMDownload(retryResult)) {
+            const notice = t("youtube.notice.retryNeedsRestart");
+            setYoutubeDialogNotice(notice);
+            setStatusMessage(notice);
+            return;
+          }
+
+          throw retryError;
+        }
+      }
     } catch (error) {
       console.error("[media] Failed to import YouTube media.", error);
-      setStatusMessage(t("youtube.notice.downloadFailed"));
+      const notice = t("youtube.notice.downloadFailed");
+      setYoutubeDialogNotice(notice);
+      setStatusMessage(notice);
     } finally {
       setIsDownloadingYouTube(false);
     }
@@ -910,8 +1122,16 @@ export default function App() {
     return Math.max(EMPTY_TIMELINE_DURATION, maxClip);
   }, [clips]);
 
+  const timelineZoomRange = useMemo(() => getTimelineZoomRange(clips), [clips]);
+
   const timelineWidth = timelineDuration * pixelsPerSecond;
   const effectivePlayhead = Math.min(playhead, timelineDuration);
+
+  useEffect(() => {
+    setPixelsPerSecond((previousZoom) =>
+      clamp(previousZoom, timelineZoomRange.min, timelineZoomRange.max),
+    );
+  }, [timelineZoomRange.max, timelineZoomRange.min]);
 
   const selectedClip = useMemo(
     () => clips.find((clip) => clip.id === selectedClipId) ?? null,
@@ -952,9 +1172,13 @@ export default function App() {
     return clips.filter((clip) => {
       const track = tracks.find((item) => item.id === clip.trackId);
       const asset = assetMap.get(clip.assetId);
+      const hasPlayableAudio =
+        asset?.type === "audio" ||
+        (asset?.type === "video" && asset.hasAudioTrack === true);
+
       return (
         track?.type === "audio" &&
-        asset?.type === "audio" &&
+        hasPlayableAudio &&
         effectivePlayhead >= clip.start &&
         effectivePlayhead < clip.start + clip.duration
       );
@@ -1118,13 +1342,48 @@ export default function App() {
     try {
       const loaded: MediaAsset[] = [];
       for (const file of Array.from(files)) {
-        loaded.push(await loadMediaAsset(file, type, mediaLoadErrors));
+        const asset = await loadMediaAsset(file, type, mediaLoadErrors);
+        loaded.push({ ...asset, sourcePath: getFilePathFromFile(file) ?? undefined });
       }
       setAssets((prev) => [...prev, ...loaded]);
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : t("errors.fileLoad"));
     }
   }, [mediaLoadErrors, t]);
+
+  const handleOpenAssetSourceFolder = useCallback(
+    async (asset: MediaAsset) => {
+      const sourcePath = asset.sourcePath?.trim();
+      if (!sourcePath) {
+        setStatusMessage(t("media.notice.sourcePathUnavailable"));
+        return;
+      }
+
+      if (!window.nebulacut?.media?.showInFolder) {
+        setStatusMessage(t("media.notice.openFolderElectronOnly"));
+        return;
+      }
+
+      try {
+        const result = await window.nebulacut.media.showInFolder(sourcePath);
+        if (result.success) {
+          setStatusMessage(null);
+          return;
+        }
+
+        if (result.reason === "INVALID_PATH") {
+          setStatusMessage(t("media.notice.sourcePathUnavailable"));
+          return;
+        }
+
+        setStatusMessage(t("media.notice.openFolderFailed"));
+      } catch (error) {
+        console.error("[media] Failed to open source folder.", error);
+        setStatusMessage(t("media.notice.openFolderFailed"));
+      }
+    },
+    [t],
+  );
 
   const handleAddClip = useCallback(
     (asset: MediaAsset, targetTrackType: TrackType) => {
@@ -1133,7 +1392,11 @@ export default function App() {
         return;
       }
 
-      if (targetTrackType === "audio" && asset.type !== "audio") {
+      if (
+        targetTrackType === "audio" &&
+        asset.type !== "audio" &&
+        !(asset.type === "video" && asset.hasAudioTrack)
+      ) {
         setStatusMessage(t("errors.onlyAudioOnAudioTrack"));
         return;
       }
@@ -1160,7 +1423,25 @@ export default function App() {
         gain: 1,
       };
 
-      setClips((prev) => [...prev, nextClip]);
+      let companionAudioClip: Clip | null = null;
+      if (targetTrackType === "video" && asset.type === "video" && asset.hasAudioTrack) {
+        const audioTrack = ensureTrack("audio");
+        if (audioTrack) {
+          companionAudioClip = {
+            id: generateId(),
+            trackId: audioTrack.id,
+            assetId: asset.id,
+            start: nextClip.start,
+            offset: nextClip.offset,
+            duration: nextClip.duration,
+            gain: 1,
+          };
+        }
+      }
+
+      setClips((prev) =>
+        companionAudioClip ? [...prev, nextClip, companionAudioClip] : [...prev, nextClip],
+      );
       setSelectedClipId(nextClip.id);
       setStatusMessage(null);
     },
@@ -1463,6 +1744,7 @@ export default function App() {
             onClick={() => {
               if (!isDownloadingYouTube) {
                 setIsYouTubeDialogOpen(false);
+                setYoutubeDialogNotice(null);
               }
             }}
           >
@@ -1491,15 +1773,27 @@ export default function App() {
                     autoFocus
                     value={youtubeUrlInput}
                     placeholder={t("youtube.inputPlaceholder")}
-                    onChange={(event) => setYoutubeUrlInput(event.target.value)}
+                    onChange={(event) => {
+                      setYoutubeUrlInput(event.target.value);
+                      setYoutubeDialogNotice(null);
+                    }}
                   />
                 </label>
+
+                {youtubeDialogNotice && (
+                  <div className="rounded border border-amber-300/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
+                    {youtubeDialogNotice}
+                  </div>
+                )}
 
                 <div className="flex items-center justify-end gap-2 border-t border-white/10 pt-3">
                   <button
                     type="button"
                     className="rounded-md border border-white/20 bg-white/5 px-3 py-1.5 text-xs text-slate-100 hover:bg-white/10"
-                    onClick={() => setIsYouTubeDialogOpen(false)}
+                    onClick={() => {
+                      setIsYouTubeDialogOpen(false);
+                      setYoutubeDialogNotice(null);
+                    }}
                     disabled={isDownloadingYouTube}
                   >
                     {t("youtube.cancel")}
@@ -1728,7 +2022,7 @@ export default function App() {
                         <span>{getAssetTypeLabel(asset.type)}</span>
                         <span>{formatTimeLabel(asset.duration)}</span>
                       </div>
-                      <div className="mt-2 flex gap-2">
+                      <div className="mt-2 flex flex-wrap gap-2">
                         {canToVideo && (
                           <button
                             className="rounded border border-cyan-300/40 bg-cyan-400/10 px-2 py-1 text-[11px] font-semibold text-cyan-100 hover:bg-cyan-400/20"
@@ -1743,6 +2037,15 @@ export default function App() {
                             onClick={() => handleAddClip(asset, "audio")}
                           >
                             {t("media.toAudioTrack")}
+                          </button>
+                        )}
+                        {isElectronRuntime && (
+                          <button
+                            className="rounded border border-white/20 bg-white/5 px-2 py-1 text-[11px] font-semibold text-slate-100 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+                            onClick={() => void handleOpenAssetSourceFolder(asset)}
+                            disabled={!asset.sourcePath?.trim()}
+                          >
+                            {t("media.openSourceFolder")}
                           </button>
                         )}
                       </div>
@@ -1973,12 +2276,16 @@ export default function App() {
               <span>{t("timeline.zoom")}</span>
               <input
                 type="range"
-                min={MIN_TIMELINE_ZOOM}
-                max={MAX_TIMELINE_ZOOM}
+                min={timelineZoomRange.min}
+                max={timelineZoomRange.max}
                 value={pixelsPerSecond}
                 onChange={(event) =>
                   setPixelsPerSecond(
-                    clamp(Number(event.target.value), MIN_TIMELINE_ZOOM, MAX_TIMELINE_ZOOM),
+                    clamp(
+                      Number(event.target.value),
+                      timelineZoomRange.min,
+                      timelineZoomRange.max,
+                    ),
                   )
                 }
               />

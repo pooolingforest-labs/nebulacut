@@ -53,6 +53,11 @@ const enMessages = {
   "media.empty": "Add videos, images, or audio to build your timeline.",
   "media.toVideoTrack": "+ Video Track",
   "media.toAudioTrack": "+ Audio Track",
+  "media.openSourceFolder": "Open Source Folder",
+  "media.notice.sourcePathUnavailable": "Original file location is unavailable.",
+  "media.notice.openFolderElectronOnly":
+    "Opening source folders is available only in the Electron app.",
+  "media.notice.openFolderFailed": "Failed to open source folder.",
   "youtube.dialog.title": "Import from YouTube",
   "youtube.dialog.description":
     "Paste a YouTube link to download locally and add it to your media library.",
@@ -68,6 +73,8 @@ const enMessages = {
   "youtube.notice.downloadFailed": "Failed to download from YouTube.",
   "youtube.notice.readFailed": "The downloaded file could not be read.",
   "youtube.notice.unsupportedType": "Downloaded media type is not supported.",
+  "youtube.notice.retryNeedsRestart":
+    "Restart the app and try again. (Main-process updates for YouTube retry may not be loaded yet.)",
   "youtube.notice.success": "Added from YouTube: {name}",
   "preview.empty": "Add clips to the timeline.",
   "controls.play": "Play",
@@ -153,6 +160,10 @@ const koMessages: Record<MessageKey, string> = {
   "media.empty": "비디오, 이미지, 오디오를 추가해서 타임라인을 구성하세요.",
   "media.toVideoTrack": "+ 비디오 트랙",
   "media.toAudioTrack": "+ 오디오 트랙",
+  "media.openSourceFolder": "원본 폴더 열기",
+  "media.notice.sourcePathUnavailable": "원본 파일 경로를 확인할 수 없습니다.",
+  "media.notice.openFolderElectronOnly": "원본 폴더 열기는 Electron 앱에서만 지원합니다.",
+  "media.notice.openFolderFailed": "원본 폴더를 열지 못했습니다.",
   "youtube.dialog.title": "유튜브에서 가져오기",
   "youtube.dialog.description":
     "유튜브 링크를 붙여 넣으면 로컬로 다운로드 후 미디어 라이브러리에 추가합니다.",
@@ -168,6 +179,8 @@ const koMessages: Record<MessageKey, string> = {
   "youtube.notice.downloadFailed": "유튜브 다운로드에 실패했습니다.",
   "youtube.notice.readFailed": "다운로드한 파일을 읽지 못했습니다.",
   "youtube.notice.unsupportedType": "지원하지 않는 미디어 형식입니다.",
+  "youtube.notice.retryNeedsRestart":
+    "앱을 다시 시작한 뒤 다시 시도하세요. (유튜브 재시도 기능이 아직 메인 프로세스에 반영되지 않았을 수 있습니다.)",
   "youtube.notice.success": "유튜브에서 추가됨: {name}",
   "preview.empty": "타임라인에 클립을 추가하세요.",
   "controls.play": "재생",
